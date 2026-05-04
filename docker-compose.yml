@@ -1,0 +1,34 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_USERNAME: tonefit_user
+      DB_PASSWORD: tonefit1234
+      DB_NAME: tonefitdb
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: tonefitdb
+      POSTGRES_USER: tonefit_user
+      POSTGRES_PASSWORD: tonefit1234
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-vol:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tonefit_user -d tonefitdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db-vol:
