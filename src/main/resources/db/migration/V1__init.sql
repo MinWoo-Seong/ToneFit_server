@@ -25,13 +25,14 @@ CREATE TABLE users (
     )
 );
 
+-- 단일 디바이스 정책: user당 refresh row 1개만 허용.
+-- generateAndSaveTokens 의 check-then-act 경합으로 행이 2개 생기는 INSERT race 차단.
+-- user_id UNIQUE 가 인덱스 역할 겸하므로 별도 비유니크 인덱스 생성 안 함.
 CREATE TABLE refresh_tokens (
     id      BIGSERIAL    PRIMARY KEY,
     token   VARCHAR(512) NOT NULL UNIQUE,
-    user_id BIGINT       NOT NULL REFERENCES users (id)
+    user_id BIGINT       NOT NULL UNIQUE REFERENCES users (id)
 );
-
-CREATE INDEX idx_refresh_tokens_user ON refresh_tokens (user_id);
 
 CREATE TABLE user_terms_agreement (
     id          BIGSERIAL    PRIMARY KEY,
