@@ -11,8 +11,6 @@ import com.example.tonefitserver.domain.correction.dto.ConfirmResponse;
 import com.example.tonefitserver.domain.correction.dto.CorrectionDetailResponse;
 import com.example.tonefitserver.domain.correction.dto.CorrectionRequest;
 import com.example.tonefitserver.domain.correction.dto.CorrectionResponse;
-import com.example.tonefitserver.domain.correction.dto.DraftResponse;
-import com.example.tonefitserver.domain.correction.dto.DraftSaveRequest;
 import com.example.tonefitserver.domain.correction.dto.EditRequest;
 import com.example.tonefitserver.domain.correction.dto.EditResponse;
 import com.example.tonefitserver.domain.correction.dto.FinalizeResponse;
@@ -38,19 +36,21 @@ import com.example.tonefitserver.domain.session.Receiver;
 import com.example.tonefitserver.domain.session.Status;
 import com.example.tonefitserver.domain.user.User;
 import com.example.tonefitserver.domain.user.UserRepository;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -65,78 +65,81 @@ public class CorrectionService {
     private final UserRepository userRepository;
     private final AiCorrectionClient aiClient;
     private final EventService eventService;
+    private final PlatformTransactionManager transactionManager;
 
-    @Transactional
-    public Optional<DraftResponse> saveDraft(Long userId, DraftSaveRequest req) {
-        User user = loadUser(userId);
-        boolean allNull = req.receiverType() == null
-                && req.purpose() == null
-                && (req.subject() == null || req.subject().isBlank())
-                && (req.originalEmail() == null || req.originalEmail().isBlank());
+    /**
+     * AI 호출(8~15초 블로킹)을 트랜잭션 밖에서 실행하기 위한 프로그래밍적 TX 경계 제어.
+     * 각 public 메서드는 prepare(TX1) → AI 호출(TX 없음) → persist(TX2) 패턴.
+     * 이렇게 분리하지 않으면 Hikari pool(max=10) 이 AI 호출 동안 점유되어 동시 10명 초과 시 즉시 병목.
+     */
+    private TransactionTemplate txTemplate;
 
-        Optional<CorrectionSession> existing = sessionRepository.findByUserIdAndStatus(user.getId(), Status.DRAFT);
-
-        if (allNull) {
-            existing.ifPresent(sessionRepository::delete);
-            return Optional.empty();
-        }
-
-        CorrectionSession session = existing.orElseGet(() -> CorrectionSession.builder()
-                .user(user)
-                .status(Status.DRAFT)
-                .build());
-        session.updateDraft(req.receiverType(), req.purpose(), req.subject(), req.originalEmail());
-        CorrectionSession saved = sessionRepository.save(session);
-        return Optional.of(toDraftResponse(saved));
+    @PostConstruct
+    void initTxTemplate() {
+        this.txTemplate = new TransactionTemplate(transactionManager);
     }
 
-    @Transactional(readOnly = true)
-    public DraftResponse getDraft(Long userId) {
-        User user = loadUser(userId);
-        CorrectionSession session = sessionRepository.findByUserIdAndStatus(user.getId(), Status.DRAFT)
-                .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "임시 저장이 없습니다."));
-        return toDraftResponse(session);
-    }
-
-    @Transactional
     public CorrectionResponse correct(Long userId, CorrectionRequest req) {
-        User user = loadUser(userId);
-        CorrectionSession session = (req.sessionId() != null)
-                ? findOwnedSession(user.getId(), req.sessionId())
-                : CorrectionSession.builder().user(user).status(Status.DRAFT).build();
+        // TX1: 새 세션 생성 + IN_PROGRESS 진입 + AI 입력 스냅샷
+        // (draft 는 FE local storage 에서 관리하므로 BE 는 1차 교정 시점에 처음 세션을 만듦)
+        AiCorrectionInput input = txTemplate.execute(status -> prepareInitialCorrection(userId, req));
 
-        if (req.sessionId() != null && session.getStatus() != Status.DRAFT) {
-            throw new BusinessException(ErrorType.INVALID_REQUEST,
-                    "DRAFT 상태의 세션에서만 1차 교정을 시작할 수 있습니다. 진행 중 세션은 /recorrect를 사용하세요.");
+        // AI 호출 (트랜잭션 밖)
+        AiCorrectionResult result;
+        try {
+            result = aiClient.correct(input.promptContent(), input.receiver(), input.purpose(),
+                    input.original(), input.protectedRanges());
+        } catch (Exception e) {
+            // TX3: 실패 시 세션 통째 삭제. 사용자 본문(개인정보) 누적 차단.
+            // FE-local draft 정책상 사용자가 재시도하면 동일 본문으로 새 요청을 보내므로 손실 없음.
+            txTemplate.executeWithoutResult(status -> deleteFailedSession(input.sessionId()));
+            throw new BusinessException(ErrorType.AI_SERVICE_ERROR,
+                    ErrorType.AI_SERVICE_ERROR.getMessage(), input.sessionId(), e);
         }
 
+        // TX2: 결과 영속화 + 이벤트 기록
+        return txTemplate.execute(status -> persistInitialCorrectionResult(input.sessionId(), result));
+    }
+
+    private AiCorrectionInput prepareInitialCorrection(Long userId, CorrectionRequest req) {
+        User user = loadUser(userId);
+        CorrectionSession session = CorrectionSession.builder()
+                .user(user)
+                .status(Status.IN_PROGRESS)
+                .build();
         session.updateDraft(req.receiverType(), req.purpose(), req.subject(), req.originalEmail());
         session.updateProtectedRanges(toRanges(req.protectedRanges()));
         session.updateInitialPromptVersion(activeInitialPrompt());
-        session.updateStatus(Status.IN_PROGRESS);
         CorrectionSession saved = sessionRepository.save(session);
 
-        feedbackRepository.deleteBySessionId(saved.getId());
+        return new AiCorrectionInput(
+                saved.getId(),
+                saved.getInitialPromptVersion() != null ? saved.getInitialPromptVersion().getContent() : null,
+                saved.getReceiverType(),
+                saved.getPurpose(),
+                saved.getOriginal(),
+                saved.getProtectedRanges()
+        );
+    }
 
-        AiCorrectionResult result;
-        try {
-            result = aiClient.correct(
-                    saved.getInitialPromptVersion() != null ? saved.getInitialPromptVersion().getContent() : null,
-                    saved.getReceiverType(),
-                    saved.getPurpose(),
-                    saved.getOriginal(),
-                    saved.getProtectedRanges()
-            );
-        } catch (Exception e) {
-            saved.updateStatus(Status.DRAFT);
-            throw new BusinessException(ErrorType.AI_SERVICE_ERROR,
-                    ErrorType.AI_SERVICE_ERROR.getMessage(), saved.getId(), e);
-        }
+    private void deleteFailedSession(Long sessionId) {
+        // 첫 1차 교정 실패 — feedback 은 아직 없을 가능성이 높지만 안전망으로 명시적 삭제.
+        feedbackRepository.deleteBySessionId(sessionId);
+        sessionRepository.deleteById(sessionId);
+    }
+
+    private CorrectionResponse persistInitialCorrectionResult(Long sessionId, AiCorrectionResult result) {
+        CorrectionSession session = sessionRepository.findById(sessionId)
+                .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "세션을 찾을 수 없습니다."));
+
+        // 옛 feedback 삭제 + 새 feedback 저장을 같은 TX 안에서 원자적으로 수행.
+        // (TX 분리 전에는 prepare 단계에서 삭제했지만, AI 실패 시 옛 데이터 손실되므로 persist 단계로 이동)
+        feedbackRepository.deleteBySessionId(sessionId);
 
         List<CorrectionFeedback> feedbacks = result.changes().stream()
                 .map(c -> CorrectionFeedback.builder()
-                        .user(saved.getUser())
-                        .session(saved)
+                        .user(session.getUser())
+                        .session(session)
                         .index(c.index())
                         .start(c.start())
                         .end(c.end())
@@ -150,39 +153,57 @@ public class CorrectionService {
                 .toList();
         feedbackRepository.saveAll(feedbacks);
 
-        eventService.record(user, EventType.STARTED, saved,
-                Map.of("input_length", saved.getOriginal() == null ? 0 : saved.getOriginal().length()));
+        eventService.record(session.getUser(), EventType.STARTED, session,
+                Map.of("input_length", session.getOriginal() == null ? 0 : session.getOriginal().length()));
 
-        return toCorrectionResponse(saved, result);
+        return toCorrectionResponse(session, result);
     }
 
-    @Transactional
     public CorrectionResponse recorrect(Long userId, Long sessionId, RecorrectRequest req) {
+        // TX1: 검증 + AI 입력 스냅샷 (세션 자체는 수정하지 않음 — 실패 시 롤백 부담 줄이기 위해)
+        AiCorrectionInput input = txTemplate.execute(status -> prepareRecorrect(userId, sessionId, req));
+
+        // AI 호출 (트랜잭션 밖)
+        AiCorrectionResult result;
+        try {
+            result = aiClient.correct(input.promptContent(), input.receiver(), input.purpose(),
+                    input.original(), input.protectedRanges());
+        } catch (Exception e) {
+            throw new BusinessException(ErrorType.AI_SERVICE_ERROR,
+                    ErrorType.AI_SERVICE_ERROR.getMessage(), sessionId, e);
+        }
+
+        // TX2: 세션 갱신 + feedback 교체
+        return txTemplate.execute(status -> persistRecorrectResult(sessionId, req, result));
+    }
+
+    private AiCorrectionInput prepareRecorrect(Long userId, Long sessionId, RecorrectRequest req) {
         User user = loadUser(userId);
         CorrectionSession session = findOwnedSession(user.getId(), sessionId);
         if (session.getStatus() != Status.IN_PROGRESS) {
             throw new BusinessException(ErrorType.INVALID_REQUEST,
                     "IN_PROGRESS 상태에서만 재교정할 수 있습니다.");
         }
+
+        PromptVersion prompt = activeInitialPrompt();
+        return new AiCorrectionInput(
+                sessionId,
+                prompt != null ? prompt.getContent() : null,
+                req.receiverType(),
+                req.purpose(),
+                session.getOriginal(),
+                session.getProtectedRanges()
+        );
+    }
+
+    private CorrectionResponse persistRecorrectResult(Long sessionId, RecorrectRequest req, AiCorrectionResult result) {
+        CorrectionSession session = sessionRepository.findById(sessionId)
+                .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "세션을 찾을 수 없습니다."));
+
         session.updateReceiverPurpose(req.receiverType(), req.purpose());
         session.updateInitialPromptVersion(activeInitialPrompt());
-        session.updateStatus(Status.IN_PROGRESS);
 
         feedbackRepository.deleteBySessionId(sessionId);
-
-        AiCorrectionResult result;
-        try {
-            result = aiClient.correct(
-                    session.getInitialPromptVersion() != null ? session.getInitialPromptVersion().getContent() : null,
-                    session.getReceiverType(),
-                    session.getPurpose(),
-                    session.getOriginal(),
-                    session.getProtectedRanges()
-            );
-        } catch (Exception e) {
-            throw new BusinessException(ErrorType.AI_SERVICE_ERROR,
-                    ErrorType.AI_SERVICE_ERROR.getMessage(), sessionId, e);
-        }
 
         List<CorrectionFeedback> feedbacks = result.changes().stream()
                 .map(c -> CorrectionFeedback.builder()
@@ -225,40 +246,62 @@ public class CorrectionService {
         return new RejectResponse(session.getId(), feedback.getIndex(), Action.REJECTED, feedback.getUpdatedAt());
     }
 
-    @Transactional
     public FinalizeResponse finalize(Long userId, Long sessionId) {
+        // TX1: 검증 + 미처리 feedback 자동 수락 + final 프롬프트 지정 + 머지 산출
+        // (auto-accept 와 prompt 버전은 dirty checking 으로 TX 커밋 시 저장됨)
+        AiFinalizeInput input = txTemplate.execute(status -> prepareFinalize(userId, sessionId));
+
+        // AI 호출 (트랜잭션 밖)
+        AiFinalizeResult result;
+        try {
+            result = aiClient.finalizePolish(input.promptContent(), input.receiver(), input.purpose(),
+                    input.mergedText(), input.protectedRanges());
+        } catch (Exception e) {
+            // AI 실패 시 rollback 없음 — auto-accept/prompt 갱신은 그대로 유지(재시도 시 멱등).
+            // 원래 동작은 트랜잭션 롤백이었지만, 분리 후엔 TX1 이 이미 커밋되어 있어 의도적으로 유지.
+            // 사용자가 재시도하면 prepareFinalize 가 다시 같은 작업을 수행 — auto-accept 는 멱등.
+            throw new BusinessException(ErrorType.AI_SERVICE_ERROR,
+                    ErrorType.AI_SERVICE_ERROR.getMessage(), sessionId, e);
+        }
+
+        // TX2: AI 결과 저장 + 상태 EDITING 전환 + 이벤트
+        return txTemplate.execute(status -> persistFinalizeResult(sessionId, result));
+    }
+
+    private AiFinalizeInput prepareFinalize(Long userId, Long sessionId) {
         User user = loadUser(userId);
         CorrectionSession session = findOwnedSession(user.getId(), sessionId);
         if (session.getStatus() != Status.IN_PROGRESS) {
             throw new BusinessException(ErrorType.INVALID_REQUEST,
                     "IN_PROGRESS 상태에서만 최종 다듬기를 진행할 수 있습니다.");
         }
-        List<CorrectionFeedback> feedbacks = feedbackRepository.findBySessionIdOrderByIndexAsc(sessionId);
 
+        List<CorrectionFeedback> feedbacks = feedbackRepository.findBySessionIdOrderByIndexAsc(sessionId);
         feedbacks.stream().filter(f -> f.getAction() == null).forEach(CorrectionFeedback::accept);
 
-        MergeResult merge = mergeForFinalize(session.getOriginal(), session.getProtectedRanges(), feedbacks);
         PromptVersion finalPrompt = activeFinalPrompt();
         session.updateFinalPromptVersion(finalPrompt);
 
-        AiFinalizeResult result;
-        try {
-            result = aiClient.finalizePolish(
-                    finalPrompt != null ? finalPrompt.getContent() : null,
-                    session.getReceiverType(),
-                    session.getPurpose(),
-                    merge.mergedText(),
-                    merge.protectedRanges()
-            );
-        } catch (Exception e) {
-            throw new BusinessException(ErrorType.AI_SERVICE_ERROR,
-                    ErrorType.AI_SERVICE_ERROR.getMessage(), sessionId, e);
-        }
+        MergeResult merge = mergeForFinalize(session.getOriginal(), session.getProtectedRanges(), feedbacks);
+
+        return new AiFinalizeInput(
+                sessionId,
+                finalPrompt != null ? finalPrompt.getContent() : null,
+                session.getReceiverType(),
+                session.getPurpose(),
+                merge.mergedText(),
+                merge.protectedRanges()
+        );
+    }
+
+    private FinalizeResponse persistFinalizeResult(Long sessionId, AiFinalizeResult result) {
+        CorrectionSession session = sessionRepository.findById(sessionId)
+                .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "세션을 찾을 수 없습니다."));
 
         session.updateAiResult(result.aiFinal(), result.aiSubject());
         session.updateStatus(Status.EDITING);
 
-        eventService.record(user, EventType.COMPLETED, session, null);
+        eventService.record(session.getUser(), EventType.COMPLETED, session, null);
 
         return new FinalizeResponse(session.getId(), session.getStatus(),
                 session.getAiFinal(), session.getAiSubject(), session.getCreatedAt());
@@ -469,9 +512,28 @@ public class CorrectionService {
     private record MergeResult(String mergedText, List<Range> protectedRanges) {
     }
 
-    private DraftResponse toDraftResponse(CorrectionSession s) {
-        return new DraftResponse(s.getId(), s.getReceiverType(), s.getPurpose(),
-                s.getSubject(), s.getOriginal(), s.getUpdatedAt());
+    /**
+     * TX1 → AI 호출 → TX2 사이에 entity 를 들고 다닐 수 없으므로 (트랜잭션 종료 후 detach) 값 객체로 스냅샷.
+     * correct/recorrect 공통.
+     */
+    private record AiCorrectionInput(
+            Long sessionId,
+            String promptContent,
+            Receiver receiver,
+            Purpose purpose,
+            String original,
+            List<Range> protectedRanges
+    ) {
+    }
+
+    private record AiFinalizeInput(
+            Long sessionId,
+            String promptContent,
+            Receiver receiver,
+            Purpose purpose,
+            String mergedText,
+            List<Range> protectedRanges
+    ) {
     }
 
     private CorrectionResponse toCorrectionResponse(CorrectionSession s, AiCorrectionResult r) {

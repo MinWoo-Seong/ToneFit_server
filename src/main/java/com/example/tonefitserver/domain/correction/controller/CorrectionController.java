@@ -5,8 +5,6 @@ import com.example.tonefitserver.domain.correction.dto.ConfirmResponse;
 import com.example.tonefitserver.domain.correction.dto.CorrectionDetailResponse;
 import com.example.tonefitserver.domain.correction.dto.CorrectionRequest;
 import com.example.tonefitserver.domain.correction.dto.CorrectionResponse;
-import com.example.tonefitserver.domain.correction.dto.DraftResponse;
-import com.example.tonefitserver.domain.correction.dto.DraftSaveRequest;
 import com.example.tonefitserver.domain.correction.dto.EditRequest;
 import com.example.tonefitserver.domain.correction.dto.EditResponse;
 import com.example.tonefitserver.domain.correction.dto.FinalizeResponse;
@@ -21,11 +19,8 @@ import com.example.tonefitserver.domain.session.Receiver;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
-
-import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/v1/corrections")
@@ -33,20 +28,6 @@ import java.util.Optional;
 public class CorrectionController {
 
     private final CorrectionService correctionService;
-
-    @PutMapping("/draft")
-    public ResponseEntity<DraftResponse> saveDraft(@AuthenticationPrincipal Long userId,
-                                                   @RequestBody DraftSaveRequest request) {
-        Optional<DraftResponse> result = correctionService.saveDraft(userId, request);
-        return result
-                .map(ResponseEntity::ok)
-                .orElseGet(() -> ResponseEntity.noContent().build());
-    }
-
-    @GetMapping("/draft")
-    public DraftResponse getDraft(@AuthenticationPrincipal Long userId) {
-        return correctionService.getDraft(userId);
-    }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)

@@ -3,6 +3,7 @@ package com.example.tonefitserver.domain.user;
 import com.example.tonefitserver.core.dto.ApiResponse;
 import com.example.tonefitserver.core.dto.user.UpdateUserRequest;
 import com.example.tonefitserver.core.dto.user.UserResponse;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
@@ -22,7 +23,7 @@ public class UserController {
     @PatchMapping("/me")
     public ApiResponse<UserResponse> updateMe(
             @AuthenticationPrincipal Long userId,
-            @RequestBody UpdateUserRequest request) {
+            @Valid @RequestBody UpdateUserRequest request) {
         return ApiResponse.success(userService.updateMe(userId, request));
     }
 }
