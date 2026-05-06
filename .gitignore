@@ -1,6 +1,5 @@
 HELP.md
 .gradle
-.ssh
 .http
 build/
 !gradle/wrapper/gradle-wrapper.jar
