@@ -1,0 +1,87 @@
+### ============================================================
+### Users API
+### 사전 조건: auth.http의 [2] 로그인 먼저 실행 (accessToken 글로벌 변수 필요)
+### ============================================================
+
+### [1] 내 정보 조회 - GET /users/me
+GET {{baseUrl}}/api/v1/users/me
+Authorization: Bearer {{accessToken}}
+
+> {%
+  client.test("내 정보 조회 성공 - 200", function() {
+    client.assert(response.status === 200, "Expected 200 OK");
+    client.assert(response.body.success === true, "Expected success: true");
+
+    var data = response.body.data;
+    client.assert(data.userId !== undefined, "userId must exist");
+    client.assert(data.email !== undefined, "email must exist");
+    client.assert(data.birthYear !== undefined, "birthYear must exist");
+    client.assert(data.industry !== undefined, "industry must exist");
+    client.assert(data.plan !== undefined, "plan must exist");
+    client.assert(data.createdAt !== undefined, "createdAt must exist");
+  });
+%}
+
+###
+
+### [2] 내 정보 수정 - PATCH /users/me (industry, companySize 변경)
+PATCH {{baseUrl}}/api/v1/users/me
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "industry": "FINANCE",
+  "companySize": "LARGE"
+}
+
+> {%
+  client.test("내 정보 수정 성공 - 200", function() {
+    client.assert(response.status === 200, "Expected 200 OK");
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.industry === "FINANCE", "industry should be updated to FINANCE");
+    client.assert(response.body.data.companySize === "LARGE", "companySize should be updated to LARGE");
+  });
+%}
+
+###
+
+### [3] 내 정보 수정 - PATCH /users/me (jobLevel, careerYear만 변경)
+PATCH {{baseUrl}}/api/v1/users/me
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "jobLevel": "SENIOR",
+  "careerYear": "THREE_TO_FIVE"
+}
+
+> {%
+  client.test("부분 수정 성공 - 200", function() {
+    client.assert(response.status === 200, "Expected 200 OK");
+    client.assert(response.body.data.jobLevel === "SENIOR", "jobLevel should be updated");
+    client.assert(response.body.data.careerYear === "THREE_TO_FIVE", "careerYear should be updated");
+  });
+%}
+
+###
+
+### [4] 인증 없이 접근 시 차단 확인
+GET {{baseUrl}}/api/v1/users/me
+
+> {%
+  client.test("토큰 없음 - 401 또는 403", function() {
+    client.assert(response.status === 401 || response.status === 403, "Expected 401 or 403");
+  });
+%}
+
+###
+
+### [5] 만료/잘못된 토큰으로 접근
+GET {{baseUrl}}/api/v1/users/me
+Authorization: Bearer invalid.token.here
+
+> {%
+  client.test("유효하지 않은 토큰 - 401 또는 403", function() {
+    client.assert(response.status === 401 || response.status === 403, "Expected 401 or 403");
+  });
+%}

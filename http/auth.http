@@ -1,0 +1,141 @@
+### ============================================================
+### Auth API
+### ============================================================
+
+### [1] 회원가입 - POST /auth/signup
+# 성공 시 access_token, refresh_token을 글로벌 변수에 저장
+POST {{baseUrl}}/api/v1/auth/signup
+Content-Type: application/json
+
+{
+  "email": "{{testEmail}}",
+  "password": "{{testPassword}}",
+  "birthYear": 1995,
+  "industry": "IT",
+  "companySize": "STARTUP",
+  "jobLevel": "STAFF",
+  "careerYear": "ONE_TO_THREE"
+}
+
+> {%
+  client.test("회원가입 성공 - 201", function() {
+    client.assert(response.status === 201, "Expected 201 Created");
+    client.assert(response.body.success === true, "Expected success: true");
+  });
+
+  if (response.body.data) {
+    client.global.set("accessToken", response.body.data.accessToken);
+    client.global.set("refreshToken", response.body.data.refreshToken);
+    client.global.set("userId", response.body.data.userId);
+  }
+%}
+
+###
+
+### [2] 로그인 - POST /auth/login
+# 성공 시 access_token, refresh_token을 글로벌 변수에 저장 (이후 API 테스트에서 사용)
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{testEmail}}",
+  "password": "{{testPassword}}"
+}
+
+> {%
+  client.test("로그인 성공 - 200", function() {
+    client.assert(response.status === 200, "Expected 200 OK");
+    client.assert(response.body.success === true, "Expected success: true");
+    client.assert(response.body.data.accessToken !== undefined, "accessToken must exist");
+    client.assert(response.body.data.refreshToken !== undefined, "refreshToken must exist");
+  });
+
+  if (response.body.data) {
+    client.global.set("accessToken", response.body.data.accessToken);
+    client.global.set("refreshToken", response.body.data.refreshToken);
+    client.global.set("userId", response.body.data.userId);
+  }
+%}
+
+###
+
+### [3] 토큰 갱신 - POST /auth/refresh
+# 로그인 후 저장된 refreshToken 사용
+# 성공 시 새 토큰으로 글로벌 변수 갱신
+POST {{baseUrl}}/api/v1/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "{{refreshToken}}"
+}
+
+> {%
+  client.test("토큰 갱신 성공 - 200", function() {
+    client.assert(response.status === 200, "Expected 200 OK");
+    client.assert(response.body.data.accessToken !== undefined, "accessToken must exist");
+  });
+
+  if (response.body.data) {
+    client.global.set("accessToken", response.body.data.accessToken);
+    client.global.set("refreshToken", response.body.data.refreshToken);
+  }
+%}
+
+###
+
+### [4] 토큰 갱신 실패 - 유효하지 않은 토큰
+POST {{baseUrl}}/api/v1/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "invalid.token.value"
+}
+
+> {%
+  client.test("유효하지 않은 토큰 - 401", function() {
+    client.assert(response.status === 401, "Expected 401 Unauthorized");
+    client.assert(response.body.success === false, "Expected success: false");
+    client.assert(response.body.error.code === "INVALID_TOKEN", "Expected INVALID_TOKEN error code");
+  });
+%}
+
+###
+
+### [5] 회원가입 실패 - 이메일 중복
+POST {{baseUrl}}/api/v1/auth/signup
+Content-Type: application/json
+
+{
+  "email": "{{testEmail}}",
+  "password": "{{testPassword}}",
+  "birthYear": 1995,
+  "industry": "IT",
+  "companySize": "STARTUP",
+  "jobLevel": "STAFF",
+  "careerYear": "ONE_TO_THREE"
+}
+
+> {%
+  client.test("이메일 중복 - 409", function() {
+    client.assert(response.status === 409, "Expected 409 Conflict");
+    client.assert(response.body.error.code === "EMAIL_ALREADY_EXISTS", "Expected EMAIL_ALREADY_EXISTS");
+  });
+%}
+
+###
+
+### [6] 로그인 실패 - 잘못된 비밀번호
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{testEmail}}",
+  "password": "wrongpassword"
+}
+
+> {%
+  client.test("잘못된 비밀번호 - 401", function() {
+    client.assert(response.status === 401, "Expected 401 Unauthorized");
+    client.assert(response.body.error.code === "INVALID_PASSWORD", "Expected INVALID_PASSWORD");
+  });
+%}
