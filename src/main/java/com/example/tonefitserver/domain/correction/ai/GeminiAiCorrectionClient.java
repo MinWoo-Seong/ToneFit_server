@@ -11,6 +11,7 @@ import org.springframework.web.client.RestClient;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -158,20 +159,13 @@ public class GeminiAiCorrectionClient implements AiCorrectionClient {
                 continue;
             }
 
-            // 등장 순서 가정: 이전 매칭 이후 위치부터 탐색
-            int found = original.indexOf(cleanOriginal, cursor);
-            if (found < 0) {
-                // 순서가 어긋났거나 앞쪽 텍스트일 수 있으므로 처음부터 재탐색
-                found = original.indexOf(cleanOriginal);
-                if (found < 0) {
-                    log.warn("Dropping change (original text not found in source): '{}'", cleanOriginal);
-                    continue;
-                }
-                log.debug("Change out of document order, matched via full scan: '{}'", cleanOriginal);
+            int[] range = findOriginalRange(original, cleanOriginal, cursor);
+            if (range == null) {
+                log.warn("Dropping change (original text not found in source): '{}'", cleanOriginal);
+                continue;
             }
-
-            int start = found;
-            int end = found + cleanOriginal.length();
+            int start = range[0];
+            int end = range[1];
 
             if (overlapsProtected(start, end, protectedRanges)) {
                 log.warn("Dropping change (overlaps protected range): [{},{})", start, end);
@@ -179,12 +173,66 @@ public class GeminiAiCorrectionClient implements AiCorrectionClient {
             }
 
             cursor = end;
+            // 원문에서 실제로 발췌한 substring 을 사용 — Gemini 가 공백 normalize 등을 했어도
+            // UI/머지에는 사용자가 실제로 입력한 형태가 들어가야 함.
+            String actualOriginal = original.substring(start, end);
             result.add(new AiCorrectionResult.Change(
                     result.size(), start, end,
-                    cleanOriginal, cleanCorrected, cleanReason,
+                    actualOriginal, cleanCorrected, cleanReason,
                     ch.label(), ch.confidence(), ch.appliedRules()));
         }
         return result;
+    }
+
+    /**
+     * 원문에서 target 의 위치를 찾는다. 단계별 fallback:
+     *   1) 정확 매칭 — cursor 이후
+     *   2) 정확 매칭 — 처음부터 (Gemini 가 순서를 어겼거나 앞쪽 매칭일 때)
+     *   3) 공백-tolerant 매칭 — Gemini 가 'executivesummary' 같은 입력을 'executive summary' 로
+     *      normalize 해서 보고하는(또는 그 역방향) 케이스 복구
+     * 못 찾으면 null.
+     */
+    private int[] findOriginalRange(String source, String target, int cursor) {
+        int found = source.indexOf(target, cursor);
+        if (found >= 0) return new int[]{found, found + target.length()};
+
+        found = source.indexOf(target);
+        if (found >= 0) {
+            log.debug("Change out of document order, matched via full scan: '{}'", target);
+            return new int[]{found, found + target.length()};
+        }
+
+        // 공백-tolerant 매칭: 양쪽 모두에서 모든 whitespace 를 제거 후 비교.
+        // target 자체에 whitespace 가 없거나 전부 whitespace 면 의미 없으므로 skip.
+        String targetNoWs = target.replaceAll("\\s+", "");
+        if (targetNoWs.isEmpty() || targetNoWs.length() == target.length()) return null;
+
+        StripResult ws = stripWhitespace(source);
+        int normPos = ws.stripped().indexOf(targetNoWs);
+        if (normPos < 0) return null;
+
+        int actualStart = ws.map()[normPos];
+        int actualEnd = ws.map()[normPos + targetNoWs.length() - 1] + 1;
+        log.debug("Recovered via whitespace-tolerant match: '{}' -> [{},{})", target, actualStart, actualEnd);
+        return new int[]{actualStart, actualEnd};
+    }
+
+    /** 공백을 제거한 문자열 + 각 char 가 원문에서 어느 인덱스였는지 매핑. */
+    private StripResult stripWhitespace(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        int[] map = new int[s.length()];
+        int j = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!Character.isWhitespace(c)) {
+                sb.append(c);
+                map[j++] = i;
+            }
+        }
+        return new StripResult(sb.toString(), Arrays.copyOf(map, j));
+    }
+
+    private record StripResult(String stripped, int[] map) {
     }
 
     private boolean overlapsProtected(int start, int end, List<Range> ranges) {
